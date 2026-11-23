@@ -1,5 +1,10 @@
 use soroban_sdk::{contracttype, Address, BytesN, Map, String, Vec};
 
+// NOTE(#648): the `boost-nft` sibling crate is WIP and not yet publishable.
+// DataKey::BoostNft and DataKey::BoostState, plus the `BoostState` struct and
+// the `Tier` enum, will be added here once boost-nft lands. For now they are
+// omitted so types.rs compiles on this branch.
+
 // ---------------------------------------------------------------------------
 // Rewards (new for #440)
 // ---------------------------------------------------------------------------
@@ -127,6 +132,47 @@ pub struct LockedPlan {
     pub balance: i128,
     /// Ledger timestamp after which withdrawal is permitted.
     pub unlock_at: u64,
+    pub created_at: u64,
+}
+
+/// Auto-rollover settings for a locked plan (#638).
+///
+/// At maturity (`now >= plan.unlock_at`) the plan's balance plus accrued
+/// interest is moved into a brand-new locked plan, and the original plan is
+/// closed with a zero balance.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RolloverConfig {
+    pub plan_id: u64,
+    pub owner: Address,
+    /// Lock period of the new plan, in seconds. `0` reuses the original
+    /// plan's term (`unlock_at - created_at`).
+    pub lock_period: u64,
+    pub enabled_at: u64,
+}
+
+/// A condition gating an automated withdrawal from a flexible account (#639).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum WithdrawalCondition {
+    /// Withdraw once the oracle price of `asset` is strictly greater than
+    /// `threshold` (in the oracle's price units).
+    PriceAbove(Address, i128),
+    /// Withdraw once the ledger timestamp reaches the given value.
+    AfterDate(u64),
+    /// Withdraw once the flexible account balance is strictly greater than
+    /// the given amount, in token stroops.
+    BalanceAbove(i128),
+}
+
+/// A pending conditional withdrawal: `amount` is paid to `owner` from their
+/// flexible account once `condition` holds.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConditionalWithdrawalRule {
+    pub owner: Address,
+    pub condition: WithdrawalCondition,
+    pub amount: i128,
     pub created_at: u64,
 }
 
@@ -288,6 +334,24 @@ pub struct UpgradeProposal {
     pub proposed_by: Address,
     pub proposed_at: u64,
     pub execute_after: u64,
+}
+
+/// Snapshot of the state before the most recent `execute_upgrade`, kept in
+/// instance storage under `DataKey::PreviousVersion` to enable a one-step
+/// rollback via `rollback_upgrade`.
+///
+/// Cleared by `rollback_upgrade` so only a single rollback level is
+/// supported per upgrade cycle. After rollback, a fresh `propose_upgrade` →
+/// `execute_upgrade` sequence must be used for further changes.
+#[contracttype]
+#[derive(Clone)]
+pub struct PreviousVersionSnapshot {
+    /// The Wasm hash that was installed as part of the upgrade we may roll
+    /// back from. Used to re-install the Wasm on rollback.
+    pub wasm_hash: BytesN<32>,
+    /// The version number before the upgrade (i.e. what `Version` will be
+    /// restored to on rollback).
+    pub version: u32,
 }
 
 /// An approved insurance claim that a user can redeem.
@@ -648,6 +712,12 @@ pub enum DataKey {
     PendingUpgrade,
     /// Minimum delay (in seconds) before a proposed upgrade can execute.
     UpgradeDelay,
+    /// Rollback snapshot: stores `PreviousVersionSnapshot`. Written by
+    /// `execute_upgrade`, cleared by `rollback_upgrade`.
+    ///
+    /// Durability: instance — single small record, same lifecycle as
+    /// `PendingUpgrade`. Absent when no rollback is available.
+    PreviousVersion,
 
     // --- Insurance fund (#435) ---
     /// Insurance fund pool balance.
@@ -706,4 +776,22 @@ pub enum DataKey {
     GroupWithdrawal(u64),
     /// Monotonic counter for multi-signature group withdrawal request ids.
     NextGroupWithdrawalId,
+
+    // --- Locked rollover (#638) ---
+    /// `RolloverConfig` for a locked plan id. Absent means no auto-rollover.
+    ///
+    /// Durability: persistent — one entry per plan. TTL: bumped on every
+    /// read/write via `extend_persistent_ttl`.
+    Rollover(u64),
+
+    // --- Conditional withdrawals (#639) ---
+    /// Admin-configured price oracle used by price-based conditions.
+    ///
+    /// Durability: instance. TTL: bumped alongside the rest of instance storage.
+    PriceOracle,
+    /// Pending `ConditionalWithdrawalRule` for a flexible account owner.
+    ///
+    /// Durability: persistent — one entry per owner. TTL: bumped on every
+    /// read/write via `extend_persistent_ttl`.
+    WithdrawalCondition(Address),
 }

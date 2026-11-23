@@ -11,12 +11,15 @@
 //! - [`group_split`] — pools settled back to members by agreed shares
 //! - [`voting`]   — members vote to spend a group's pool
 //! - [`interest`] — balances that grow by compound interest
+//! - [`rollover`] — locked plans that roll into a new term at maturity
+//! - [`conditional`] — withdrawals gated on price, date or balance conditions
 //!
 //! This is a **skeleton**: every entrypoint is stubbed with `unimplemented!()`
 //! and a `TODO(issue)` describing the work. Each stub is one contributor issue.
 
 mod admin;
 mod challenge;
+mod conditional;
 mod delegation;
 mod error;
 mod events;
@@ -27,18 +30,20 @@ mod group;
 mod group_split;
 mod insurance;
 mod interest;
+pub mod interest_tiers;
 mod limits;
 mod locked;
 pub mod rewards;
 mod roundup;
-mod challenge;
 mod multisig;
-mod locked;
-pub mod rewards;
 mod recurring;
+pub mod rewards;
+mod rollover;
+mod roundup;
 mod storage;
 mod timelock;
 mod types;
+pub mod upgrade;
 mod voting;
 
 #[cfg(test)]
@@ -49,22 +54,18 @@ mod test;
 #[path = "test/limits_test.rs"]
 mod limits_test;
 
-// Standalone split tests (#629).
 #[cfg(test)]
-#[path = "test/split_test.rs"]
-mod split_test;
+#[path = "test/collateral_test.rs"]
+mod collateral_test;
 
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Map, String};
+use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Map, String, Vec};
 
 use crate::error::Error;
 use crate::types::{
     Challenge, ChallengeKind, CompoundFrequency, Delegation, FlexibleAccount, Goal, Group,
-    GroupLimits, InsuranceClaimRecord, InterestAccount, LockedPlan, PermissionLevel, Proposal,
-    QueuedAction, RewardState, RewardsConfig, RoundupConfig, RoundupLevel, TimelockAction,
-    UpgradeProposal,
-    CompoundFrequency, FlexibleAccount, Goal, Group, GroupLimits, InsuranceClaimRecord,
-    GroupWithdrawalRequest, InterestAccount, LockedPlan, Proposal, RecurringDeposit,
-    RecurringFrequency, UpgradeProposal,
+    GroupLimits, GroupWithdrawalRequest, InsuranceClaimRecord, InterestAccount, LockedPlan,
+    PermissionLevel, Proposal, QueuedAction, RecurringDeposit, RecurringFrequency, RewardState,
+    RewardsConfig, RoundupConfig, RoundupLevel, TimelockAction, UpgradeProposal,
 };
 
 #[contract]
@@ -184,6 +185,45 @@ impl SavingsVault {
         flexible::get_account(&env, owner)
     }
 
+    // --- conditional withdrawals (#639) -----------------------------------
+    /// Set the price oracle consulted by price-based withdrawal conditions.
+    /// Admin-only.
+    pub fn set_price_oracle(env: Env, caller: Address, oracle: Address) -> Result<(), Error> {
+        conditional::set_price_oracle(&env, caller, oracle)
+    }
+
+    /// The configured price oracle, if any.
+    pub fn price_oracle(env: Env) -> Option<Address> {
+        conditional::price_oracle(&env)
+    }
+
+    /// Register a withdrawal of `amount` from the owner's flexible account
+    /// that may only execute once `condition` holds.
+    pub fn set_withdrawal_condition(
+        env: Env,
+        owner: Address,
+        condition: WithdrawalCondition,
+        amount: i128,
+    ) -> Result<(), Error> {
+        conditional::set_withdrawal_condition(&env, owner, condition, amount)
+    }
+
+    /// Cancel the owner's pending conditional withdrawal.
+    pub fn cancel_withdrawal_condition(env: Env, owner: Address) -> Result<(), Error> {
+        conditional::cancel_withdrawal_condition(&env, owner)
+    }
+
+    /// The owner's pending conditional withdrawal, if any.
+    pub fn withdrawal_condition(env: Env, owner: Address) -> Option<ConditionalWithdrawalRule> {
+        conditional::get_withdrawal_condition(&env, owner)
+    }
+
+    /// Execute the owner's conditional withdrawal once its condition holds.
+    /// Permissionless; funds are always paid to `owner`.
+    pub fn execute_conditional_withdrawal(env: Env, owner: Address) -> Result<i128, Error> {
+        conditional::execute_conditional_withdrawal(&env, owner)
+    }
+
     // --- recurring deposits (#615) ----------------------------------------
     /// Set up a recurring wallet deposit. The owner must authorize the call
     /// and approve the vault as a SEP-41 spender before execution.
@@ -251,8 +291,48 @@ impl SavingsVault {
         locked::early_withdraw(&env, owner, plan_id, amount)
     }
 
+    /// Liquidate `liquidation_bps` basis points of a still-locked plan's
+    /// balance, paying the early-withdrawal penalty on that slice only. See
+    /// `locked::partial_liquidate`.
+    pub fn partial_liquidate(
+        env: Env,
+        owner: Address,
+        plan_id: u64,
+        liquidation_bps: u32,
+    ) -> Result<i128, Error> {
+        locked::partial_liquidate(&env, owner, plan_id, liquidation_bps)
+    }
+
     pub fn locked_plan(env: Env, plan_id: u64) -> Result<LockedPlan, Error> {
         locked::get_plan(&env, plan_id)
+    }
+
+    // --- locked rollover (#638) -------------------------------------------
+    /// Opt a locked plan into auto-rollover at maturity. `lock_period` is the
+    /// new plan's lock length in seconds; `0` reuses the original term.
+    pub fn enable_auto_rollover(
+        env: Env,
+        owner: Address,
+        plan_id: u64,
+        lock_period: u64,
+    ) -> Result<(), Error> {
+        rollover::enable_auto_rollover(&env, owner, plan_id, lock_period)
+    }
+
+    /// Opt a locked plan out of auto-rollover. Only allowed before maturity.
+    pub fn disable_auto_rollover(env: Env, owner: Address, plan_id: u64) -> Result<(), Error> {
+        rollover::disable_auto_rollover(&env, owner, plan_id)
+    }
+
+    /// Roll a matured plan (balance + interest) into a new locked plan and
+    /// close the original. Permissionless; returns the new plan id.
+    pub fn execute_rollover(env: Env, plan_id: u64) -> Result<u64, Error> {
+        rollover::execute_rollover(&env, plan_id)
+    }
+
+    /// A plan's auto-rollover settings, if enabled.
+    pub fn rollover_config(env: Env, plan_id: u64) -> Option<RolloverConfig> {
+        rollover::get_config(&env, plan_id)
     }
 
     // --- goal --------------------------------------------------------------
@@ -512,6 +592,32 @@ impl SavingsVault {
         interest::accrued(&env, owner)
     }
 
+    // --- interest rate tiers (#619) ----------------------------------------
+
+    /// Set the tiered interest-rate configuration. Admin-only.
+    ///
+    /// Rates must be non-decreasing across balance tiers (`low ≤ mid ≤ high`).
+    /// No individual rate or bonus may exceed 10 000 bps (100 %). Emits an
+    /// `InterestRateChanged` event.
+    ///
+    /// Errors: `NotInitialized`, `Unauthorized`, `InvalidParameters`.
+    pub fn set_tiered_rate_config(
+        env: Env,
+        caller: Address,
+        config: TieredRateConfig,
+    ) -> Result<(), Error> {
+        interest_tiers::set_tiered_rate_config(&env, caller, config)
+    }
+
+    /// Return the effective annual interest rate (bps) for an account with
+    /// principal `balance` and remaining lock duration `lock_secs`.
+    ///
+    /// Pass `lock_secs = 0` for accounts with no active lock. This is a
+    /// read-only view; it neither mutates state nor emits events.
+    pub fn query_interest_rate(env: Env, balance: i128, lock_secs: u64) -> u32 {
+        interest_tiers::query_rate(&env, balance, lock_secs)
+    }
+
     // --- emergency mode (#428) --------------------------------------------
 
     /// Activate or deactivate emergency mode. Admin-only.
@@ -575,6 +681,27 @@ impl SavingsVault {
     /// Run post-upgrade state migration. Admin-only.
     pub fn migrate(env: Env, caller: Address) -> Result<(), Error> {
         admin::migrate(&env, caller)
+    }
+
+    /// Roll back to the previous version. Admin-only.
+    ///
+    /// Available only after a successful `execute_upgrade`; the rollback
+    /// snapshot is cleared once used (single-level rollback). Decrements the
+    /// version counter and emits an `upgrade_rolled_back` event.
+    ///
+    /// Errors `NoRollbackAvailable` if no snapshot exists (either no upgrade
+    /// has been executed since initialize, or rollback has already been used
+    /// once since the last upgrade).
+    pub fn rollback_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        upgrade::rollback_upgrade(&env, caller)
+    }
+
+    /// Whether a rollback snapshot is currently available.
+    ///
+    /// Returns `true` immediately after a successful `execute_upgrade` and
+    /// `false` after `rollback_upgrade` is called (or before the first upgrade).
+    pub fn rollback_available(env: Env) -> bool {
+        upgrade::rollback_available(&env)
     }
 
     // --- insurance fund (#435) --------------------------------------------
